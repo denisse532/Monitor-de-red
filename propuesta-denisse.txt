@@ -1,0 +1,184 @@
+# ================================================
+# Escaneo de red + Guardar en MySQL/MariaDB
+# ================================================
+
+# Ruta al conector MySQL (.dll)
+$mysqlDllPath = 'C:\Program Files (x86)\MySQL\MySQL Connector NET 9.4\MySql.Data.dll'
+[void][System.Reflection.Assembly]::LoadFrom($mysqlDllPath)
+
+# -----------------------
+# Configuración de MySQL/MariaDB
+# -----------------------
+$server   = "192.168.100.69"     
+$port     = 3306
+$database = "red_local"
+$user     = "adminphp"
+$password = "denisse123"
+
+# Cadena de conexión
+$connStr = "server=$server;port=$port;uid=$user;pwd=$password;database=$database;SslMode=none"
+try {
+    $conn = New-Object MySql.Data.MySqlClient.MySqlConnection($connStr)
+    $conn.Open()
+    Write-Host ("✅ Conectado a MySQL en {0}:{1} (BD: {2})" -f $server, $port, $database)
+} catch {
+    Write-Error ("❌ Error al conectar a MySQL: {0}" -f $_.Exception.Message)
+    exit 1
+}
+
+# -----------------------
+# Crear tablas si no existen
+# -----------------------
+$createTables = @"
+CREATE TABLE IF NOT EXISTS resultados_red (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  ip VARCHAR(50) NOT NULL,
+  nombre_equipo VARCHAR(255),
+  mac VARCHAR(50),
+  puerto INT NULL,
+  servicio VARCHAR(100),
+  estado VARCHAR(20) NOT NULL,
+  fecha DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS ips_inactivas (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  ip VARCHAR(50) NOT NULL,
+  estado VARCHAR(20) NOT NULL,
+  fecha DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"@
+$cmd = $conn.CreateCommand()
+$cmd.CommandText = $createTables
+$cmd.ExecuteNonQuery() | Out-Null
+
+# -----------------------
+# Rango de IPs y puertos
+# -----------------------
+$ips = 1..100 | ForEach-Object { "192.168.100.$_" }
+$puertos = @(21,22,23,25,53,80,110,135,139,143,443,445,3306,3389)
+
+# Salida opcional
+$desktop = [Environment]::GetFolderPath('Desktop')
+$txtOut = Join-Path $desktop "resultados_red.txt"
+Set-Content -Path $txtOut -Value ("Escaneo iniciado - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n")
+
+# -----------------------
+# Funciones auxiliares
+# -----------------------
+function Test-ICMP($ip, $timeoutMs) {
+    try {
+        $p = New-Object System.Net.NetworkInformation.Ping
+        $r = $p.Send($ip, $timeoutMs)
+        return ($r.Status -eq 'Success')
+    } catch { return $false }
+}
+
+function Test-Port($ip, $port, $timeoutMs) {
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $async = $client.BeginConnect($ip, $port, $null, $null)
+        $ok = $async.AsyncWaitHandle.WaitOne($timeoutMs)
+        if ($ok -and $client.Connected) {
+            $client.EndConnect($async)
+            $client.Close()
+            return $true
+        } else { try { $client.Close() } catch {} ; return $false }
+    } catch { return $false }
+}
+
+function Get-ServiceName($port) {
+    switch ($port) {
+        21   { "FTP" }; 22 { "SSH" }; 23 { "Telnet" }; 25 { "SMTP" }
+        53   { "DNS" }; 80 { "HTTP" }; 110 { "POP3" }; 135 { "RPC" }
+        139  { "NetBIOS" }; 143 { "IMAP" }; 443 { "HTTPS" }; 445 { "SMB" }
+        3306 { "MySQL" }; 3389 { "RDP" }; default { "Desconocido" }
+    }
+}
+
+function Get-MAC($ip) {
+    try {
+        $nb = Get-NetNeighbor -IPAddress $ip -ErrorAction SilentlyContinue
+        if ($nb -and $nb.LinkLayerAddress -and $nb.LinkLayerAddress -ne "00-00-00-00-00-00") {
+            return $nb.LinkLayerAddress
+        }
+    } catch {}
+    return "No disponible"
+}
+
+# -----------------------
+# Escaneo principal
+# -----------------------
+$PingTimeout = 300
+$PortTimeout = 500
+
+foreach ($ip in $ips) {
+    Write-Host -NoNewline ("Comprobando {0} ... " -f $ip)
+    $alive = Test-ICMP $ip $PingTimeout
+    $fecha = Get-Date
+
+    if ($alive) {
+        Write-Host "online" -ForegroundColor Green
+        try { $hn = [System.Net.Dns]::GetHostEntry($ip).HostName } catch { $hn = "No disponible" }
+        $mac = Get-MAC $ip
+
+        # Insert registro IP activa (sin puerto)
+        try {
+            $cmdIns = $conn.CreateCommand()
+            $cmdIns.CommandText = "INSERT INTO resultados_red (ip, nombre_equipo, mac, puerto, servicio, estado, fecha) VALUES (@ip,@hn,@mac,NULL,'','online',@fecha)"
+            $cmdIns.Parameters.Clear()
+            $cmdIns.Parameters.AddWithValue("@ip",$ip) | Out-Null
+            $cmdIns.Parameters.AddWithValue("@hn",$hn) | Out-Null
+            $cmdIns.Parameters.AddWithValue("@mac",$mac) | Out-Null
+            $cmdIns.Parameters.AddWithValue("@fecha",$fecha) | Out-Null
+            $cmdIns.ExecuteNonQuery() | Out-Null
+        } catch {
+            Add-Content -Path $txtOut -Value ("ERROR INSERT base para {0}: {1}" -f $ip, $_.Exception.Message)
+        }
+
+        # Insertar solo puertos abiertos
+        foreach ($p in $puertos) {
+            if (Test-Port $ip $p $PortTimeout) {
+                $svc = Get-ServiceName $p
+                Write-Host ("  Puerto {0} abierto ({1})" -f $p, $svc)
+                try {
+                    $cmdP = $conn.CreateCommand()
+                    $cmdP.CommandText = "INSERT INTO resultados_red (ip, nombre_equipo, mac, puerto, servicio, estado, fecha) VALUES (@ip,@hn,@mac,@port,@svc,'online',@fecha)"
+                    $cmdP.Parameters.Clear()
+                    $cmdP.Parameters.AddWithValue("@ip",$ip) | Out-Null
+                    $cmdP.Parameters.AddWithValue("@hn",$hn) | Out-Null
+                    $cmdP.Parameters.AddWithValue("@mac",$mac) | Out-Null
+                    $cmdP.Parameters.AddWithValue("@port",[int]$p) | Out-Null
+                    $cmdP.Parameters.AddWithValue("@svc",$svc) | Out-Null
+                    $cmdP.Parameters.AddWithValue("@fecha",$fecha) | Out-Null
+                    $cmdP.ExecuteNonQuery() | Out-Null
+                } catch {
+                    Add-Content -Path $txtOut -Value ("ERROR INSERT puerto {0} para {1}: {2}" -f $p, $ip, $_.Exception.Message)
+                }
+            }
+        }
+    } else {
+        Write-Host "offline" -ForegroundColor DarkGray
+        # Guardar IP inactiva en otra tabla
+        try {
+            $cmdInact = $conn.CreateCommand()
+            $cmdInact.CommandText = "INSERT INTO ips_inactivas (ip, estado, fecha) VALUES (@ip,'offline',@fecha)"
+            $cmdInact.Parameters.Clear()
+            $cmdInact.Parameters.AddWithValue("@ip",$ip) | Out-Null
+            $cmdInact.Parameters.AddWithValue("@fecha",$fecha) | Out-Null
+            $cmdInact.ExecuteNonQuery() | Out-Null
+        } catch {
+            Add-Content -Path $txtOut -Value ("ERROR INSERT inactiva para {0}: {1}" -f $ip, $_.Exception.Message)
+        }
+    }
+}
+
+# -----------------------
+# Cerrar conexión y finalizar
+# -----------------------
+$conn.Close()
+Write-Host ""
+Write-Host "✅ Escaneo completado."
+Write-Host ("  - TXT: {0}" -f $txtOut)
+Write-Host ("  - MySQL: base de datos '{0}', tablas 'resultados_red' y 'ips_inactivas'" -f $database)
+
